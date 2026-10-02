@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# Streamlit secrets (contains credentials - NEVER commit)
+.streamlit/secrets.toml
+
+# Snowflake
+.snowflake/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Plan files
+.snowflake/
