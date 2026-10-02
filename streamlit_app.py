@@ -4,7 +4,6 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import numpy as np
-import snowflake.connector
 
 st.set_page_config(
     page_title="UrbanBrew Location Intelligence",
@@ -13,68 +12,145 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-
-@st.cache_resource
-def get_connection():
-    return snowflake.connector.connect(
-        connection_name="bzrlvzw-mx84149",
-        database="URBANBREW_LOCATION_INTEL",
-        schema="ANALYTICS",
-        client_store_temporary_credential=False,
-    )
+DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 
 
-sf_conn = get_connection()
+def haversine_km(lat1, lon1, lat2, lon2):
+    lat1, lon1, lat2, lon2 = map(np.radians, [lat1, lon1, lat2, lon2])
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = np.sin(dlat / 2) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2) ** 2
+    return 6371 * 2 * np.arcsin(np.sqrt(a))
 
 
-def run_query(sql):
-    cur = sf_conn.cursor()
-    cur.execute(sql)
-    cols = [desc[0] for desc in cur.description]
-    result = pd.DataFrame(cur.fetchall(), columns=cols)
-    for col in result.columns:
-        if result[col].dtype == object:
-            try:
-                result[col] = pd.to_numeric(result[col])
-            except (ValueError, TypeError):
-                pass
-    return result
+def minmax_score(series, invert=False):
+    mn, mx = series.min(), series.max()
+    if mx == mn:
+        return pd.Series(50.0, index=series.index)
+    normed = (series - mn) / (mx - mn)
+    if invert:
+        normed = 1 - normed
+    return (normed * 100).round(1)
 
 
-@st.cache_data(ttl=300)
-def load_scorecard():
-    return run_query("""
-        SELECT * FROM URBANBREW_LOCATION_INTEL.ANALYTICS.LOCATION_SCORECARD
-        ORDER BY OPPORTUNITY_SCORE DESC
-    """)
+@st.cache_data
+def load_and_score():
+    candidates = pd.read_csv(os.path.join(DATA_DIR, "candidate_locations.csv"))
+    competitors = pd.read_csv(os.path.join(DATA_DIR, "competitor_cafes.csv"))
+    metro = pd.read_csv(os.path.join(DATA_DIR, "metro_stations.csv"))
+    pois = pd.read_csv(os.path.join(DATA_DIR, "commercial_pois.csv"))
+    stores = pd.read_csv(os.path.join(DATA_DIR, "existing_stores.csv"))
+    assets = pd.read_csv(os.path.join(DATA_DIR, "household_assets_2011.csv"))
+
+    # Uppercase column names to match existing UI code
+    for frame in [candidates, competitors, metro, pois, stores, assets]:
+        frame.columns = [c.upper() for c in frame.columns]
+
+    rows = []
+    for _, cl in candidates.iterrows():
+        # --- Competition ---
+        dists_comp = competitors.apply(
+            lambda c: haversine_km(cl["LAT"], cl["LON"], c["LAT"], c["LON"]), axis=1
+        )
+        nearby = competitors[dists_comp <= 1.0]
+        comp_count = len(nearby)
+        direct_coffee = len(
+            nearby[
+                (nearby["TYPE"] == "Cafe")
+                & nearby["CUISINE_OR_CATEGORY"].isin(["Coffee Chain", "Specialty Coffee"])
+            ]
+        )
+
+        # --- Accessibility ---
+        dists_metro = metro.apply(
+            lambda m: haversine_km(cl["LAT"], cl["LON"], m["LAT"], m["LON"]), axis=1
+        )
+        op_mask = metro["STATUS"] == "Operational"
+        nearest_op_metro = dists_metro[op_mask].min() if op_mask.any() else np.nan
+        ridership_nearby = metro[(dists_metro <= 2.0) & op_mask]
+        max_ridership = int(ridership_nearby["DAILY_RIDERSHIP_ESTIMATE"].max()) if len(ridership_nearby) else 0
+
+        # --- Commercial Activity ---
+        dists_poi = pois.apply(
+            lambda p: haversine_km(cl["LAT"], cl["LON"], p["LAT"], p["LON"]), axis=1
+        )
+        nearby_pois = pois[dists_poi <= 1.5]
+        cat_counts = nearby_pois["CATEGORY"].value_counts()
+        edu = int(cat_counts.get("Education", 0))
+        hc = int(cat_counts.get("Healthcare", 0))
+        hosp = int(cat_counts.get("Hospitality", 0))
+        off = int(cat_counts.get("Office-IT", 0))
+        ret = int(cat_counts.get("Retail-Mall", 0))
+        ent = int(cat_counts.get("Entertainment", 0))
+        tour = int(cat_counts.get("Tourism", 0))
+        trans = int(cat_counts.get("Transport", 0))
+        weighted_poi = (
+            edu * 1.2 + hc * 0.8 + hosp * 1.5 + off * 2.0
+            + ret * 1.8 + ent * 1.3 + tour * 1.0 + trans * 1.5
+        )
+
+        # --- Purchasing Power ---
+        area_match = assets[assets["AREA_NAME"] == cl["AREA"]]
+        asset_index = float(area_match["ASSET_INDEX"].iloc[0]) if len(area_match) else 0.0
+
+        # --- Cannibalization ---
+        dists_stores = stores.apply(
+            lambda s: haversine_km(cl["LAT"], cl["LON"], s["LAT"], s["LON"]), axis=1
+        )
+        nearest_idx = dists_stores.idxmin()
+        nearest_ub_km = round(dists_stores[nearest_idx], 2)
+        nearest_store_name = stores.loc[nearest_idx, "STORE_NAME"]
+
+        rows.append({
+            "LOCATION_ID": cl["LOCATION_ID"],
+            "LOCATION_NAME": cl["LOCATION_NAME"],
+            "AREA": cl["AREA"],
+            "ZONE_TYPE": cl["ZONE_TYPE"],
+            "AVG_RENT_PER_SQFT": cl["AVG_RENT_PER_SQFT"],
+            "FOOTFALL_ESTIMATE_CATEGORY": cl["FOOTFALL_ESTIMATE_CATEGORY"],
+            "LAT": cl["LAT"],
+            "LON": cl["LON"],
+            "COMPETITORS_WITHIN_1KM": comp_count,
+            "DIRECT_COFFEE_COMPETITORS": direct_coffee,
+            "NEAREST_OPERATIONAL_METRO_KM": round(nearest_op_metro, 2) if pd.notna(nearest_op_metro) else None,
+            "MAX_NEARBY_RIDERSHIP": max_ridership,
+            "EDUCATION_POIS": edu,
+            "HEALTHCARE_POIS": hc,
+            "HOSPITALITY_POIS": hosp,
+            "OFFICE_IT_POIS": off,
+            "RETAIL_POIS": ret,
+            "WEIGHTED_POI": weighted_poi,
+            "ASSET_INDEX": asset_index,
+            "NEAREST_URBANBREW_KM": nearest_ub_km,
+            "NEAREST_STORE_NAME": nearest_store_name,
+        })
+
+    df = pd.DataFrame(rows)
+
+    # Min-max normalization scores
+    df["COMPETITION_SCORE"] = minmax_score(df["COMPETITORS_WITHIN_1KM"], invert=True)
+    df["ACCESSIBILITY_SCORE"] = minmax_score(df["NEAREST_OPERATIONAL_METRO_KM"], invert=True)
+    df["COMMERCIAL_ACTIVITY_SCORE"] = minmax_score(df["WEIGHTED_POI"])
+    df["PURCHASING_POWER_SCORE"] = minmax_score(df["ASSET_INDEX"])
+    df["CANNIBALIZATION_SCORE"] = minmax_score(df["NEAREST_URBANBREW_KM"])
+
+    # Demand proxy = 0.65 * commercial + 0.35 * accessibility
+    df["DEMAND_PROXY_SCORE"] = (0.65 * df["COMMERCIAL_ACTIVITY_SCORE"] + 0.35 * df["ACCESSIBILITY_SCORE"]).round(1)
+
+    # Default opportunity score
+    df["OPPORTUNITY_SCORE"] = (
+        0.20 * df["COMPETITION_SCORE"]
+        + 0.15 * df["ACCESSIBILITY_SCORE"]
+        + 0.25 * df["COMMERCIAL_ACTIVITY_SCORE"]
+        + 0.15 * df["PURCHASING_POWER_SCORE"]
+        + 0.15 * df["DEMAND_PROXY_SCORE"]
+        + 0.10 * df["CANNIBALIZATION_SCORE"]
+    ).round(1)
+
+    return df, competitors, pois, stores, metro
 
 
-@st.cache_data(ttl=300)
-def load_competitors():
-    return run_query("""
-        SELECT * FROM URBANBREW_LOCATION_INTEL.RAW.COMPETITOR_CAFES
-    """)
-
-
-@st.cache_data(ttl=300)
-def load_pois():
-    return run_query("""
-        SELECT * FROM URBANBREW_LOCATION_INTEL.RAW.COMMERCIAL_POIS
-    """)
-
-
-@st.cache_data(ttl=300)
-def load_existing_stores():
-    return run_query("""
-        SELECT * FROM URBANBREW_LOCATION_INTEL.RAW.EXISTING_STORES
-    """)
-
-
-@st.cache_data(ttl=300)
-def load_metro():
-    return run_query("""
-        SELECT * FROM URBANBREW_LOCATION_INTEL.RAW.METRO_STATIONS
-    """)
+df, df_competitors, df_pois, df_stores, df_metro = load_and_score()
 
 
 def compute_weighted_score(row, weights):
@@ -88,12 +164,6 @@ def compute_weighted_score(row, weights):
         1,
     )
 
-
-df = load_scorecard()
-df_competitors = load_competitors()
-df_pois = load_pois()
-df_stores = load_existing_stores()
-df_metro = load_metro()
 
 # --- Sidebar ---
 st.sidebar.title("UrbanBrew Location Intelligence")
@@ -129,7 +199,7 @@ weights = {
 df["CUSTOM_SCORE"] = df.apply(lambda r: compute_weighted_score(r, weights), axis=1)
 df = df.sort_values("CUSTOM_SCORE", ascending=False).reset_index(drop=True)
 
-# Grade based on custom score
+
 def assign_grade(score):
     if score >= 70:
         return "A - Strong"
@@ -138,6 +208,7 @@ def assign_grade(score):
     elif score >= 30:
         return "C - Investigate"
     return "D - Low"
+
 
 df["CUSTOM_GRADE"] = df["CUSTOM_SCORE"].apply(assign_grade)
 
@@ -212,7 +283,6 @@ elif page == "Location Deep Dive":
 
     st.markdown("---")
 
-    # Radar chart
     categories = [
         "Competition", "Accessibility", "Commercial\nActivity",
         "Purchasing\nPower", "Demand\nProxy", "Cannibalization",
@@ -241,7 +311,6 @@ elif page == "Location Deep Dive":
     )
     st.plotly_chart(fig_radar, use_container_width=True)
 
-    # Nearby details
     st.subheader("Nearby Competitors (within 1 km)")
     st.write(f"**{int(loc['COMPETITORS_WITHIN_1KM'])}** total | **{int(loc['DIRECT_COFFEE_COMPETITORS'])}** direct coffee competitors")
 
@@ -297,7 +366,6 @@ elif page == "Compare Locations":
             "Purchasing Power", "Demand Proxy", "Cannibalization",
         ]
 
-        # Grouped bar chart
         melted = comp_df.melt(
             id_vars=["LOCATION_NAME"],
             value_vars=score_cols,
@@ -318,7 +386,6 @@ elif page == "Compare Locations":
         )
         st.plotly_chart(fig_comp, use_container_width=True)
 
-        # Overlay radar
         fig_radar = go.Figure()
         colors = ["#29B5E8", "#FF6B6B", "#4ECB71", "#FFA726"]
         for i, (_, row) in enumerate(comp_df.iterrows()):
@@ -336,7 +403,6 @@ elif page == "Compare Locations":
         )
         st.plotly_chart(fig_radar, use_container_width=True)
 
-        # Summary table
         summary_cols = ["LOCATION_NAME", "AREA", "CUSTOM_SCORE", "CUSTOM_GRADE",
                         "COMPETITORS_WITHIN_1KM", "NEAREST_OPERATIONAL_METRO_KM",
                         "NEAREST_URBANBREW_KM", "AVG_RENT_PER_SQFT"]
@@ -348,24 +414,10 @@ elif page == "Map View":
     st.title("Jaipur Location Map")
     st.markdown("Candidate locations, existing UrbanBrew stores, competitors, and metro stations.")
 
-    # Score-based color
-    def score_color(score):
-        if score >= 70:
-            return [46, 204, 113, 180]
-        elif score >= 50:
-            return [243, 156, 18, 180]
-        elif score >= 30:
-            return [230, 126, 34, 180]
-        return [231, 76, 60, 180]
-
     map_df = df[["LOCATION_NAME", "LAT", "LON", "CUSTOM_SCORE", "CUSTOM_GRADE", "AREA"]].copy()
-    map_df["color"] = map_df["CUSTOM_SCORE"].apply(score_color)
-    map_df["size"] = map_df["CUSTOM_SCORE"] * 5 + 200
 
-    # Use plotly scattermapbox for richer map
     fig_map = go.Figure()
 
-    # Candidate locations
     fig_map.add_trace(go.Scattermap(
         lat=map_df["LAT"],
         lon=map_df["LON"],
@@ -384,7 +436,6 @@ elif page == "Map View":
         hovertemplate="<b>%{text}</b><br>Score: %{marker.color:.1f}<extra></extra>",
     ))
 
-    # Existing stores
     fig_map.add_trace(go.Scattermap(
         lat=df_stores["LAT"],
         lon=df_stores["LON"],
@@ -395,7 +446,6 @@ elif page == "Map View":
         hovertemplate="<b>%{text}</b><br>(Existing Store)<extra></extra>",
     ))
 
-    # Metro stations
     operational = df_metro[df_metro["STATUS"] == "Operational"]
     fig_map.add_trace(go.Scattermap(
         lat=operational["LAT"],
@@ -419,7 +469,6 @@ elif page == "Map View":
     )
     st.plotly_chart(fig_map, use_container_width=True)
 
-    # Legend
     col1, col2, col3, col4 = st.columns(4)
     col1.markdown("**Green** = Score >= 70 (A)")
     col2.markdown("**Yellow** = Score 50-69 (B)")
